@@ -41,7 +41,21 @@ async function startBot() {
     // הפעל את הלקוח, הוא ימצא את הקבצים המשוחזרים
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: CLIENT_ID }),
-        puppeteer: { /* ... הגדרות puppeteer ... */ }
+        
+        // <<< התיקון הקריטי והסופי נמצא כאן >>>
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process', // <- יכול לעזור בסביבות מוגבלות
+                '--disable-gpu'
+            ],
+        }
     });
 
     client.on('ready', () => {

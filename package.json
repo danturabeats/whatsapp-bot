@@ -10,14 +10,18 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "archiver": "^7.0.1",
     "body-parser": "^2.2.0",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "fs-extra": "^11.3.0",
     "mongoose": "^8.17.0",
+    "node-cache": "^5.1.2",
+    "node-cron": "^4.2.1",
     "qrcode-terminal": "^0.12.0",
     "unzipper": "^0.12.3",
-    "whatsapp-web.js": "latest"
+    "whatsapp-web.js": "latest",
+    "winston": "^3.17.0"
   }
 }

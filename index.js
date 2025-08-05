@@ -1,95 +1,65 @@
 console.log("--- MAIN BOT SCRIPT (RESTORE AND RUN) ---");
+// =========================================================
+// קובץ מפעיל ראשי - index.js
+// =========================================================
+
+// טעינת משתני סביבה מקובץ .env
 require('dotenv').config();
-const { Client, LocalAuth } = require('whatsapp-web.js');
 const express = require('express');
+
+// ייבוא מחלקת הבוט הראשית מהקובץ החדש שיצרנו
+const PresentorWhatsAppBot = require('./bot.js');
 const mongoose = require('mongoose');
-const fs = require('fs-extra');
-const path = require('path');
-const stream = require('stream');
-const unzipper = require('unzipper');
 
-// הגדרות זהות לקובץ יצירת ה-session
-const { Schema } = mongoose;
-const SessionSchema = new Schema({_id: String, session_zip: Buffer});
-const Session = mongoose.models.Session || mongoose.model('Session', SessionSchema);
-const CLIENT_ID = 'my-whatsapp-bot';
-const AUTH_DIR = path.join(__dirname, '.wwebjs_auth');
-
-async function startBot() {
-    console.log('Connecting to MongoDB...');
-    await mongoose.connect(process.env.MONGO_URI);
-    console.log('Connected to MongoDB.');
-
-    // שחזר את ה-session מה-DB
-    console.log('Attempting to restore session from DB...');
-    const savedSession = await Session.findById(CLIENT_ID);
-    if (!savedSession) {
-        throw new Error('SESSION NOT FOUND IN MONGODB. Please run the generate-session.js script locally first.');
+// פונקציית הפעלה ראשית
+async function main() {
+    // ודא שכל המפתחות הנדרשים קיימים
+    if (!process.env.GEMINI_API_KEY || !process.env.MONGODB_URI) {
+        console.error('FATAL ERROR: Required environment variables (GEMINI_API_KEY, MONGODB_URI) are not defined in .env file.');
+        process.exit(1);
     }
 
+    // התחברות למסד הנתונים
     try {
-        console.log('✅ Found session in DB. Restoring...');
-        await fs.remove(AUTH_DIR); // נקה תיקייה ישנה
-        const bufferStream = new stream.PassThrough();
-        bufferStream.end(savedSession.session_zip);
-        await bufferStream.pipe(unzipper.Extract({ path: AUTH_DIR })).promise();
-        console.log('✅ Session restored locally.');
-    } catch (e) {
-        throw new Error(`Failed to restore session from DB: ${e.message}`);
+        await mongoose.connect(process.env.MONGODB_URI);
+        console.log('Successfully connected to MongoDB Atlas.');
+    } catch (error) {
+        console.error('FATAL ERROR: Could not connect to MongoDB Atlas.', error);
+        process.exit(1);
     }
 
-    // הפעל את הלקוח, הוא ימצא את הקבצים המשוחזרים
-    const client = new Client({
-        authStrategy: new LocalAuth({ clientId: CLIENT_ID }),
-        
-        // <<< התיקון הקריטי והסופי נמצא כאן >>>
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process', // <- יכול לעזור בסביבות מוגבלות
-                '--disable-gpu'
-            ],
-        }
+    // יצירת מופע חדש של הבוט
+    const bot = new PresentorWhatsAppBot();
+
+    // (אופציונלי) האזנה לאירועים שהבוט מייצר
+    bot.on('ready', () => {
+        console.log('Main application confirmed: Bot is fully operational and ready.');
     });
 
-    client.on('ready', () => {
-        console.log('WhatsApp client is ready!');
+    bot.on('newCustomer', (phoneNumber) => {
+        console.log(`New customer detected in main application: ${phoneNumber}`);
     });
 
-    client.on('message', message => {
-        if (message.body.toLowerCase() === '!ping') {
-            message.reply('pong');
-        }
+    bot.on('statistics', (data) => {
+        // כאן תוכל, למשל, לשמור את הנתונים ל-MongoDB
+        // console.log('Statistics event received:', data);
     });
 
-    client.on('auth_failure', (msg) => {
-        // אם האימות נכשל, זה אומר שה-session שגובה כבר לא תקין
-        console.error('AUTHENTICATION FAILURE. The saved session might be invalid. Please run generate-session.js again.', msg);
-        process.exit(1); // צא מהתהליך עם שגיאה
-    });
-    
-    client.on('disconnected', (reason) => {
-        console.log('Client was logged out', reason);
-        // הבוט יפסיק לעבוד. צריך יהיה להפעיל מחדש את generate-session.js
+    // הפעלת הבוט
+    bot.start().catch(error => {
+        console.error('Failed to start the bot:', error);
         process.exit(1);
     });
 
-    console.log('Initializing client with restored session...');
-    await client.initialize();
-    
+    // Express server for Keep-Alive on Render
     const app = express();
-    const PORT = process.env.PORT || 8080;
-    app.get('/', (req, res) => res.status(200).send('WhatsApp Bot is alive!'));
-    app.listen(PORT, () => console.log(`Server for Keep-Alive is listening on port ${PORT}`));
+    const port = process.env.PORT || 3000;
+    app.get('/', (req, res) => res.send('WhatsApp Bot is running!'));
+    app.listen(port, () => console.log(`Server for Keep-Alive is listening on port ${port}`));
 }
 
-startBot().catch(err => {
-    console.error("FATAL ERROR during bot startup:", err);
-    process.exit(1); // צא מהתהליך עם שגיאה
+// קריאה לפונקציה הראשית
+main().catch(err => {
+    console.error("An unexpected error occurred in the main function:", err);
+    process.exit(1);
 });

@@ -3,6 +3,9 @@
 
 # Session data
 /session/
+whatsapp-session/
+session_backup.zip
+.wwebjs_auth/
 
 # Environment variables
 .env
@@ -11,11 +14,11 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+whatsapp-bot.log
+*.log
 
 # Local session generation script
 generate-session.js
-
-
 
 # WhatsApp Web JS session data
 .wwebjs_auth/

@@ -183,8 +183,23 @@ class PresentorWhatsAppBot extends EventEmitter {
     initializeWhatsAppEvents() {
         // QR Code להתחברות
         this.client.on('qr', (qr) => {
-            logger.info('QR Code received, scan please');
-            qrcode.generate(qr, { small: true });
+            logger.info('QR Code received, preparing to display...');
+            
+            // =========================================================
+            // <<< התיקון הקריטי נמצא כאן >>>
+            // =========================================================
+            qrcode.toString(qr, { type: 'terminal', small: true }, (err, qrString) => {
+                if (err) {
+                    logger.error("Failed to generate QR code string", err);
+                    return;
+                }
+                // אנחנו מדפיסים ישירות ל-console כדי לעקוף את ה-logger שמוסיף קידומת
+                console.log("\n--- SCAN THIS QR CODE ---");
+                console.log(qrString);
+
+                // ורק לשם התיעוד, נשמור לוג נקי
+                logger.info('QR code has been displayed in the console.');
+            });
         });
         
         // התחברות מוצלחת

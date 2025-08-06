@@ -231,7 +231,14 @@ class CustomSessionStore {
                 return false;
             }
 
-            logger.info('Starting session backup...');
+            // תיקון באג ה-session ID - אם זה undefined, נשתמש בdefault
+            const originalSessionId = sessionId;
+            if (!sessionId || sessionId === 'undefined') {
+                sessionId = 'RemoteAuth-my-whatsapp-bot';
+                logger.warn(`Session ID was '${originalSessionId}', using default: ${sessionId}`);
+            }
+
+            logger.info(`Starting session backup for ID: ${sessionId}...`);
             const buffer = await this.compressSession(this.sessionPath);
             const checksum = this.createChecksum(buffer);
 
@@ -271,7 +278,12 @@ class CustomSessionStore {
     // שחזור Session מהמסד
     async restoreSession(sessionId = 'default') {
         try {
-            logger.info('Attempting to restore session from database...');
+            // תיקון באג ה-session ID - שימוש באותו ID כמו בsave
+            if (!sessionId || sessionId === 'undefined') {
+                sessionId = 'RemoteAuth-my-whatsapp-bot';
+            }
+
+            logger.info(`Attempting to restore session for ID: ${sessionId}...`);
 
             const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
                 sessionId: { type: String, unique: true },
@@ -315,6 +327,11 @@ class CustomSessionStore {
     // בדיקת קיום Session תקין
     async sessionExists(sessionId = 'default') {
         try {
+            // תיקון באג ה-session ID - שימוש באותו ID כמו בfunctions אחרים
+            if (!sessionId || sessionId === 'undefined') {
+                sessionId = 'RemoteAuth-my-whatsapp-bot';
+            }
+
             const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
                 sessionId: { type: String, unique: true },
                 data: Buffer,
@@ -352,6 +369,36 @@ class CustomSessionStore {
             clearInterval(this.backupInterval);
             this.backupInterval = null;
             logger.info('Periodic backup stopped');
+        }
+    }
+
+    // ניקוי sessions עם IDs פגומים
+    async cleanupCorruptedSessions() {
+        try {
+            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
+                sessionId: { type: String, unique: true },
+                data: Buffer,
+                checksum: String,
+                createdAt: Date,
+                size: Number
+            }));
+
+            // מחיקת sessions עם undefined או null
+            const result = await SessionModel.deleteMany({ 
+                $or: [
+                    { sessionId: { $in: [null, 'undefined', ''] } },
+                    { sessionId: { $exists: false } }
+                ]
+            });
+
+            if (result.deletedCount > 0) {
+                logger.info(`Cleaned up ${result.deletedCount} corrupted session records`);
+            }
+
+            return result.deletedCount;
+        } catch (error) {
+            logger.error('Error cleaning corrupted sessions:', error);
+            return 0;
         }
     }
 }
@@ -863,6 +910,9 @@ class PresentorWhatsAppBot extends EventEmitter {
         logger.info('Starting WhatsApp Bot with enhanced session management...');
         
         try {
+            // ניקוי sessions פגומים לפני שחזור
+            await this.sessionStore.cleanupCorruptedSessions();
+            
             // ניסיון שחזור Session מהמסד נתונים
             const sessionRestored = await this.sessionStore.restoreSession();
             if (sessionRestored) {

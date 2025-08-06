@@ -12,7 +12,6 @@ const path = require('path');
 const archiver = require('archiver');
 const unzipper = require('unzipper');
 const crypto = require('crypto');
-const tarStream = require('tar-stream');
 
 // הגדרת Logger
 const logger = winston.createLogger({
@@ -155,6 +154,22 @@ class CustomSessionStore {
         this.backupInterval = null;
         this.lastBackupTime = null;
         
+        // יצירת Schema וModel פעם אחת
+        this.sessionSchema = new require('mongoose').Schema({
+            sessionId: { type: String, unique: true },
+            data: Buffer,
+            checksum: String,
+            createdAt: Date,
+            size: Number
+        });
+        
+        // בדיקה אם המודל כבר קיים
+        try {
+            this.SessionModel = require('mongoose').model('Session');
+        } catch (error) {
+            this.SessionModel = require('mongoose').model('Session', this.sessionSchema);
+        }
+        
         logger.info('CustomSessionStore initialized');
     }
 
@@ -163,33 +178,53 @@ class CustomSessionStore {
         return crypto.createHash('sha256').update(buffer).digest('hex');
     }
 
-    // דחיסת תיקיית Session ל-buffer
+    // דחיסת תיקיית Session ל-buffer (ZIP format - יציב יותר)
     async compressSession(sessionPath) {
         return new Promise((resolve, reject) => {
-            const buffers = [];
-            const archive = archiver('tar', { 
-                gzip: true,
-                gzipOptions: { level: 9 } 
-            });
+            try {
+                const buffers = [];
+                const archive = archiver('zip', { 
+                    zlib: { level: 9 },
+                    forceLocalTime: true
+                });
 
-            archive.on('data', (data) => buffers.push(data));
-            archive.on('end', () => {
-                const buffer = Buffer.concat(buffers);
-                resolve(buffer);
-            });
-            archive.on('error', reject);
+                archive.on('error', (error) => {
+                    logger.error('Compression error:', error);
+                    reject(error);
+                });
 
-            if (fs.existsSync(sessionPath)) {
-                archive.directory(sessionPath, false);
+                archive.on('data', (data) => buffers.push(data));
+                
+                archive.on('end', () => {
+                    try {
+                        const buffer = Buffer.concat(buffers);
+                        logger.info(`Compression completed: ${buffer.length} bytes`);
+                        resolve(buffer);
+                    } catch (error) {
+                        reject(error);
+                    }
+                });
+
+                if (fs.existsSync(sessionPath)) {
+                    archive.directory(sessionPath, false);
+                    archive.finalize();
+                } else {
+                    // יצירת ZIP ריק אם התיקייה לא קיימת
+                    archive.finalize();
+                }
+                
+            } catch (error) {
+                logger.error('Failed to initialize compression:', error);
+                reject(error);
             }
-            archive.finalize();
         });
     }
 
-    // שחזור Session מ-buffer
+    // שחזור Session מ-buffer (ZIP format)
     async extractSession(buffer, targetPath) {
         try {
             await fs.ensureDir(targetPath);
+            logger.info(`Extracting session to ${targetPath}...`);
             
             return new Promise((resolve, reject) => {
                 const stream = require('stream');
@@ -197,25 +232,15 @@ class CustomSessionStore {
                 bufferStream.end(buffer);
 
                 bufferStream
-                    .pipe(require('zlib').createGunzip())
-                    .pipe(tarStream.extract())
-                    .on('entry', async (header, stream, next) => {
-                        if (header.type === 'file') {
-                            const filePath = path.join(targetPath, header.name);
-                            await fs.ensureDir(path.dirname(filePath));
-                            const writeStream = fs.createWriteStream(filePath);
-                            stream.pipe(writeStream);
-                            writeStream.on('close', next);
-                        } else {
-                            stream.on('end', next);
-                            stream.resume();
-                        }
-                    })
-                    .on('finish', () => {
-                        logger.info(`Session extracted to ${targetPath}`);
+                    .pipe(unzipper.Extract({ path: targetPath }))
+                    .on('close', () => {
+                        logger.info(`Session extracted successfully to ${targetPath}`);
                         resolve();
                     })
-                    .on('error', reject);
+                    .on('error', (error) => {
+                        logger.error('Extraction error:', error);
+                        reject(error);
+                    });
             });
         } catch (error) {
             logger.error('Error extracting session:', error);
@@ -239,7 +264,20 @@ class CustomSessionStore {
             }
 
             logger.info(`Starting session backup for ID: ${sessionId}...`);
-            const buffer = await this.compressSession(this.sessionPath);
+            
+            let buffer;
+            try {
+                buffer = await this.compressSession(this.sessionPath);
+            } catch (compressionError) {
+                logger.error('Compression failed:', compressionError);
+                return false;
+            }
+
+            if (!buffer || buffer.length === 0) {
+                logger.warn('Empty buffer generated, skipping backup');
+                return false;
+            }
+
             const checksum = this.createChecksum(buffer);
 
             const sessionData = {
@@ -250,24 +288,22 @@ class CustomSessionStore {
                 size: buffer.length
             };
 
-            // שמירה ב-MongoDB
-            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
-                sessionId: { type: String, unique: true },
-                data: Buffer,
-                checksum: String,
-                createdAt: Date,
-                size: Number
-            }));
+            try {
+                // שמירה ב-MongoDB
+                await this.SessionModel.findOneAndUpdate(
+                    { sessionId },
+                    sessionData,
+                    { upsert: true }
+                );
 
-            await SessionModel.findOneAndUpdate(
-                { sessionId },
-                sessionData,
-                { upsert: true }
-            );
+                this.lastBackupTime = new Date();
+                logger.info(`Session backed up successfully. Size: ${Math.round(buffer.length / 1024)}KB, Checksum: ${checksum.substring(0, 8)}...`);
+                return true;
 
-            this.lastBackupTime = new Date();
-            logger.info(`Session backed up successfully. Size: ${Math.round(buffer.length / 1024)}KB, Checksum: ${checksum.substring(0, 8)}...`);
-            return true;
+            } catch (dbError) {
+                logger.error('Database save failed:', dbError);
+                return false;
+            }
 
         } catch (error) {
             logger.error('Error saving session:', error);
@@ -285,15 +321,7 @@ class CustomSessionStore {
 
             logger.info(`Attempting to restore session for ID: ${sessionId}...`);
 
-            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
-                sessionId: { type: String, unique: true },
-                data: Buffer,
-                checksum: String,
-                createdAt: Date,
-                size: Number
-            }));
-
-            const sessionDoc = await SessionModel.findOne({ sessionId });
+            const sessionDoc = await this.SessionModel.findOne({ sessionId });
             
             if (!sessionDoc) {
                 logger.info('No session found in database');
@@ -332,15 +360,7 @@ class CustomSessionStore {
                 sessionId = 'RemoteAuth-my-whatsapp-bot';
             }
 
-            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
-                sessionId: { type: String, unique: true },
-                data: Buffer,
-                checksum: String,
-                createdAt: Date,
-                size: Number
-            }));
-
-            const session = await SessionModel.findOne({ sessionId });
+            const session = await this.SessionModel.findOne({ sessionId });
             return session && session.data && session.data.length > 0;
         } catch (error) {
             logger.error('Error checking session existence:', error);
@@ -355,8 +375,15 @@ class CustomSessionStore {
         }
 
         this.backupInterval = setInterval(async () => {
-            if (fs.existsSync(this.sessionPath)) {
-                await this.saveSession();
+            try {
+                if (fs.existsSync(this.sessionPath)) {
+                    const success = await this.saveSession();
+                    if (!success) {
+                        logger.warn('Periodic backup failed, will retry next interval');
+                    }
+                }
+            } catch (error) {
+                logger.error('Periodic backup error:', error);
             }
         }, config.sessionBackupInterval);
 
@@ -375,16 +402,8 @@ class CustomSessionStore {
     // ניקוי sessions עם IDs פגומים
     async cleanupCorruptedSessions() {
         try {
-            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
-                sessionId: { type: String, unique: true },
-                data: Buffer,
-                checksum: String,
-                createdAt: Date,
-                size: Number
-            }));
-
             // מחיקת sessions עם undefined או null
-            const result = await SessionModel.deleteMany({ 
+            const result = await this.SessionModel.deleteMany({ 
                 $or: [
                     { sessionId: { $in: [null, 'undefined', ''] } },
                     { sessionId: { $exists: false } }
@@ -504,16 +523,23 @@ class PresentorWhatsAppBot extends EventEmitter {
             // שמירת Session למסד נתונים
             setTimeout(async () => {
                 try {
+                    logger.info('Starting initial session backup...');
                     const saved = await this.sessionStore.saveSession();
                     if (saved) {
                         logger.info('Initial session backup completed successfully');
                         // התחלת גיבוי תקופתי
                         this.sessionStore.startPeriodicBackup();
+                    } else {
+                        logger.warn('Initial session backup failed, periodic backup will retry');
+                        // התחל גיבוי תקופתי בכל מקרה - אולי יעבוד בניסיון הבא
+                        this.sessionStore.startPeriodicBackup();
                     }
                 } catch (error) {
                     logger.error('Error during initial session backup:', error);
+                    // התחל גיבוי תקופתי למרות השגיאה
+                    this.sessionStore.startPeriodicBackup();
                 }
-            }, 60000); // המתנה של דקה לוודא שהsession מוכן
+            }, 30000); // המתנה של 30 שניות במקום דקה
 
             this.emit('ready');
             this.sendStartupNotification();

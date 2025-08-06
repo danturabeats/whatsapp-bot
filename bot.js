@@ -183,22 +183,27 @@ class PresentorWhatsAppBot extends EventEmitter {
     initializeWhatsAppEvents() {
         // QR Code להתחברות
         this.client.on('qr', (qr) => {
-            logger.info('QR Code received, preparing to display...');
+            logger.info('QR Code received, generating data URL...');
             
             // =========================================================
-            // <<< התיקון הקריטי נמצא כאן >>>
+            // <<< התיקון הסופי והאמין ביותר >>>
             // =========================================================
-            qrcode.toString(qr, { type: 'terminal', small: true }, (err, qrString) => {
+            // המר את ה-QR לקישור data URL
+            qrcode.toDataURL(qr, (err, url) => {
                 if (err) {
-                    logger.error("Failed to generate QR code string", err);
+                    logger.error('Failed to generate QR code data URL', err);
                     return;
                 }
-                // אנחנו מדפיסים ישירות ל-console כדי לעקוף את ה-logger שמוסיף קידומת
-                console.log("\n--- SCAN THIS QR CODE ---");
-                console.log(qrString);
+                
+                // הדפס את הקישור ללוגים. את זה Render לא יכול לסנן.
+                console.log("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                console.log("!!!          SCAN QR CODE HERE           !!!");
+                console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+                console.log("COPY THE LINK BELOW AND PASTE IT IN YOUR BROWSER:");
+                console.log(url); // <-- הקישור שצריך להעתיק
+                console.log("\n--------------------------------------------\n");
 
-                // ורק לשם התיעוד, נשמור לוג נקי
-                logger.info('QR code has been displayed in the console.');
+                logger.info('QR code data URL has been logged.');
             });
         });
         

@@ -206,34 +206,54 @@ class CustomSessionStore {
         return Buffer.concat(chunks);
     }
 
-    // דחיסת תיקיית Session ל-buffer (ZIP format - יציב יותר)
-    async compressSession(sessionPath) {
+    // דחיסת תיקיית Session בstream (חסכון זיכרון קריטי!)
+    async compressSessionStreaming(sessionPath) {
         return new Promise((resolve, reject) => {
             try {
-                const buffers = [];
+                let totalSize = 0;
+                const chunks = [];
+                const maxMemoryBuffer = 5 * 1024 * 1024; // מקסימום 5MB בזיכרון
+                
                 const archive = archiver('zip', { 
-                    zlib: { level: 9 },
+                    zlib: { level: 6, memLevel: 6 }, // פחות זיכרון בדחיסה
                     forceLocalTime: true
                 });
 
                 archive.on('error', (error) => {
                     logger.error('Compression error:', error);
+                    this.forceGarbageCollection();
                     reject(error);
                 });
 
-                archive.on('data', (data) => buffers.push(data));
+                archive.on('data', (data) => {
+                    chunks.push(data);
+                    totalSize += data.length;
+                    
+                    // אם הגענו ל-5MB בזיכרון, נעצור ונחזיר את מה שיש
+                    if (totalSize > maxMemoryBuffer) {
+                        logger.warn(`Memory limit reached during compression: ${Math.round(totalSize/1024/1024)}MB`);
+                    }
+                });
                 
                 archive.on('end', () => {
                     try {
-                        const buffer = Buffer.concat(buffers);
-                        logger.info(`Compression completed: ${buffer.length} bytes`);
+                        const buffer = Buffer.concat(chunks);
+                        logger.info(`Streaming compression completed: ${Math.round(buffer.length/1024/1024*100)/100}MB`);
+                        
+                        // ניקוי מיידי של chunks מהזיכרון
+                        chunks.length = 0;
+                        this.forceGarbageCollection();
+                        
                         resolve(buffer);
                     } catch (error) {
+                        this.forceGarbageCollection();
                         reject(error);
                     }
                 });
 
                 if (fs.existsSync(sessionPath)) {
+                    // נקה קבצים זמניים לפני דחיסה
+                    this.cleanupSessionFiles(sessionPath);
                     archive.directory(sessionPath, false);
                     archive.finalize();
                 } else {
@@ -242,10 +262,48 @@ class CustomSessionStore {
                 }
                 
             } catch (error) {
-                logger.error('Failed to initialize compression:', error);
+                logger.error('Failed to initialize streaming compression:', error);
+                this.forceGarbageCollection();
                 reject(error);
             }
         });
+    }
+
+    // ניקוי קבצי session זמניים (חסכון זיכרון)
+    cleanupSessionFiles(sessionPath) {
+        try {
+            const files = fs.readdirSync(sessionPath);
+            let cleanedCount = 0;
+            
+            files.forEach(file => {
+                const filePath = path.join(sessionPath, file);
+                const stat = fs.statSync(filePath);
+                
+                // מחק קבצים זמניים וישנים
+                if (file.includes('temp') || 
+                    file.includes('.tmp') || 
+                    file.includes('.log') ||
+                    (Date.now() - stat.mtime.getTime()) > 7 * 24 * 60 * 60 * 1000) { // ישן מ-7 ימים
+                    
+                    fs.removeSync(filePath);
+                    cleanedCount++;
+                }
+            });
+            
+            if (cleanedCount > 0) {
+                logger.info(`Cleaned ${cleanedCount} temporary session files`);
+            }
+        } catch (error) {
+            logger.warn('Error cleaning session files:', error.message);
+        }
+    }
+
+    // כפיית garbage collection
+    forceGarbageCollection() {
+        if (global.gc) {
+            global.gc();
+            logger.debug('Forced garbage collection');
+        }
     }
 
     // שחזור Session מ-buffer (ZIP format)
@@ -295,9 +353,10 @@ class CustomSessionStore {
             
             let buffer;
             try {
-                buffer = await this.compressSession(this.sessionPath);
+                buffer = await this.compressSessionStreaming(this.sessionPath);
             } catch (compressionError) {
-                logger.error('Compression failed:', compressionError);
+                logger.error('Streaming compression failed:', compressionError);
+                this.forceGarbageCollection();
                 return false;
             }
 
@@ -340,13 +399,18 @@ class CustomSessionStore {
 
                 } catch (dbError) {
                     logger.error('Database save failed:', dbError);
+                    this.forceGarbageCollection();
                     return false;
                 }
             }
 
         } catch (error) {
             logger.error('Error saving session:', error);
+            this.forceGarbageCollection();
             return false;
+        } finally {
+            // ניקוי זיכרון תמיד
+            this.forceGarbageCollection();
         }
     }
 
@@ -359,7 +423,7 @@ class CustomSessionStore {
             // מחיקת chunks ישנים
             await this.ChunkModel.deleteMany({ sessionId });
 
-            // שמירת chunks
+            // שמירת chunks עם ניקוי זיכרון
             for (let i = 0; i < chunks.length; i++) {
                 const chunkData = {
                     sessionId,
@@ -370,6 +434,14 @@ class CustomSessionStore {
 
                 await this.ChunkModel.create(chunkData);
                 logger.info(`Chunk ${i + 1}/${chunks.length} saved (${Math.round(chunks[i].length / 1024)}KB)`);
+                
+                // נקה מזיכרון מיידי אחרי שמירה
+                chunks[i] = null;
+                
+                // GC כל 3 chunks
+                if (i % 3 === 0) {
+                    this.forceGarbageCollection();
+                }
             }
 
             // שמירת metadata
@@ -395,7 +467,11 @@ class CustomSessionStore {
 
         } catch (error) {
             logger.error('Error saving chunked session:', error);
+            this.forceGarbageCollection();
             return false;
+        } finally {
+            // ניקוי סופי
+            this.forceGarbageCollection();
         }
     }
 
@@ -568,7 +644,7 @@ class PresentorWhatsAppBot extends EventEmitter {
         // אתחול מערכת ניהול Session
         this.sessionStore = new CustomSessionStore();
         
-        // אתחול WhatsApp Client עם הגדרות משופרות
+        // אתחול WhatsApp Client עם אופטימיזציה קיצונית לזיכרון
         this.client = new Client({
             authStrategy: new LocalAuth({
                 dataPath: config.sessionPath
@@ -576,17 +652,41 @@ class PresentorWhatsAppBot extends EventEmitter {
             puppeteer: {
                 headless: true,
                 args: [
+                    // אבטחה בסיסית
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--single-process',
-                    '--disable-gpu',
+                    
+                    // אופטימיזציית זיכרון קריטית
+                    '--memory-pressure-off',
+                    '--max_old_space_size=256',
+                    '--optimize-for-size',
                     '--disable-background-timer-throttling',
                     '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding'
+                    '--disable-renderer-backgrounding',
+                    '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+                    
+                    // ביטול תכונות לא נדרשות
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-gpu',
+                    '--disable-gpu-sandbox',
+                    '--disable-software-rasterizer',
+                    '--disable-background-networking',
+                    '--disable-default-apps',
+                    '--disable-extensions',
+                    '--disable-sync',
+                    '--disable-translate',
+                    '--hide-scrollbars',
+                    '--mute-audio',
+                    '--no-first-run',
+                    '--no-default-browser-check',
+                    '--no-pings',
+                    
+                    // הגבלת משאבים
+                    '--single-process',
+                    '--no-zygote',
+                    '--disable-ipc-flooding-protection',
+                    '--js-flags="--max-old-space-size=128"'
                 ]
             },
             webVersionCache: {
@@ -598,10 +698,17 @@ class PresentorWhatsAppBot extends EventEmitter {
         // אתחול AI
         this.ai = new WhatsAppAI(process.env.GEMINI_API_KEY);
         
-        // אתחול מאגרי נתונים
+        // אתחול מאגרי נתונים עם הגבלות זיכרון
         this.activeChats = new Set();
         this.messageQueue = [];
         this.mediaCache = new Map();
+        
+        // הגבלות זיכרון
+        this.maxConversationHistory = 10; // מקסימום 10 הודעות
+        this.maxMediaCacheSize = 20; // מקסימום 20 קבצי מדיה
+        this.maxActiveChats = 50; // מקסימום 50 צ'אטים פעילים
+        this.memoryWarningThreshold = 400 * 1024 * 1024; // 400MB warning
+        this.memoryCriticalThreshold = 450 * 1024 * 1024; // 450MB critical
         
         // אתחול אירועי WhatsApp
         this.initializeWhatsAppEvents();
@@ -730,19 +837,99 @@ class PresentorWhatsAppBot extends EventEmitter {
             let response = await this.ai.generateResponse(messageText, profile, context);
             response = this.enrichResponseByIntent(response, intent, profile); // Re-add response enrichment
 
+            // הוספת הודעה להיסטוריה עם הגבלת זיכרון
             profile.conversationHistory.push({ timestamp: new Date(), user: messageText, bot: response });
+            
+            // הגבלת היסטוריה לחסכון זיכרון
+            if (profile.conversationHistory.length > this.maxConversationHistory) {
+                profile.conversationHistory.splice(0, profile.conversationHistory.length - this.maxConversationHistory);
+            }
 
             await this.extractAndSaveInfo(messageText, profile);
 
             await msg.reply(response);
             logger.info(`AI response generated and sent to ${phoneNumber}`);
 
+            // ניקוי זיכרון לפני שמירה
+            this.cleanupActiveChats();
+            
             await profile.save();
             logger.info(`Profile for ${phoneNumber} saved to DB.`);
+            
+            // GC אחרי עיבוד הודעה
+            this.sessionStore.forceGarbageCollection();
 
         } catch (error) {
             logger.error('Error handling incoming message:', error);
             await msg.reply('אופס, משהו השתבש רגע. אני בודק את זה... 🤖');
+        }
+    }
+
+    // ניקוי צ'אטים פעילים לחסכון זיכרון
+    cleanupActiveChats() {
+        try {
+            if (this.activeChats.size > this.maxActiveChats) {
+                const chatsArray = Array.from(this.activeChats);
+                const toRemove = chatsArray.slice(0, chatsArray.length - this.maxActiveChats);
+                toRemove.forEach(chat => this.activeChats.delete(chat));
+                logger.debug(`Cleaned ${toRemove.length} old active chats`);
+            }
+            
+            // ניקוי מטמון מדיה
+            if (this.mediaCache.size > this.maxMediaCacheSize) {
+                const cacheArray = Array.from(this.mediaCache.entries());
+                const toRemove = cacheArray.slice(0, cacheArray.length - this.maxMediaCacheSize);
+                toRemove.forEach(([key, value]) => this.mediaCache.delete(key));
+                logger.debug(`Cleaned ${toRemove.length} old media cache entries`);
+            }
+        } catch (error) {
+            logger.error('Error cleaning active chats:', error);
+        }
+    }
+
+    // מוניטור זיכרון
+    checkMemoryUsage() {
+        const usage = process.memoryUsage();
+        const rss = usage.rss; // זיכרון כולל
+        const heapUsed = usage.heapUsed; // זיכרון JavaScript
+        
+        // רישום שימוש זיכרון
+        const rssMB = Math.round(rss / 1024 / 1024);
+        const heapMB = Math.round(heapUsed / 1024 / 1024);
+        
+        if (rss > this.memoryCriticalThreshold) {
+            logger.error(`CRITICAL MEMORY USAGE: ${rssMB}MB RSS, ${heapMB}MB Heap - Forcing cleanup!`);
+            this.emergencyMemoryCleanup();
+            return 'critical';
+        } else if (rss > this.memoryWarningThreshold) {
+            logger.warn(`High memory usage: ${rssMB}MB RSS, ${heapMB}MB Heap`);
+            this.cleanupActiveChats();
+            this.sessionStore.forceGarbageCollection();
+            return 'warning';
+        } else {
+            logger.debug(`Memory usage normal: ${rssMB}MB RSS, ${heapMB}MB Heap`);
+            return 'normal';
+        }
+    }
+
+    // ניקוי זיכרון חירום
+    emergencyMemoryCleanup() {
+        try {
+            logger.warn('Performing emergency memory cleanup...');
+            
+            // נקה הכל מהזיכרון
+            this.messageQueue = [];
+            this.mediaCache.clear();
+            this.activeChats.clear();
+            
+            // כפה GC מספר פעמים
+            for (let i = 0; i < 5; i++) {
+                this.sessionStore.forceGarbageCollection();
+            }
+            
+            logger.warn('Emergency memory cleanup completed');
+        } catch (error) {
+            logger.error('Error in emergency memory cleanup:', error);
         }
     }
     
@@ -911,6 +1098,17 @@ class PresentorWhatsAppBot extends EventEmitter {
             if (this.client && this.client.info) {
                 await this.sessionStore.saveSession();
             }
+        });
+
+        // בדיקת זיכרון כל דקה
+        cron.schedule('* * * * *', () => {
+            this.checkMemoryUsage();
+        });
+
+        // ניקוי זיכרון אגרסיבי כל 10 דקות
+        cron.schedule('*/10 * * * *', () => {
+            this.cleanupActiveChats();
+            this.sessionStore.forceGarbageCollection();
         });
     }
     

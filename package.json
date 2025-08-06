@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node --expose-gc --max-old-space-size=400 index.js",
     "setup": "node setup.js",
-    "dev": "LOG_LEVEL=debug node index.js",
+    "dev": "LOG_LEVEL=debug node --expose-gc --max-old-space-size=400 index.js",
     "health": "node health-check.js",
     "cleanup": "node cleanup-sessions.js",
     "test": "node setup.js && echo \"✅ Setup validation passed\""

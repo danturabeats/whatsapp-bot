@@ -154,21 +154,35 @@ class CustomSessionStore {
         this.backupInterval = null;
         this.lastBackupTime = null;
         
-        // יצירת Schema וModel פעם אחת
+        // יצירת Schema וModel פעם אחת עם chunking support
         this.sessionSchema = new require('mongoose').Schema({
             sessionId: { type: String, unique: true },
             data: Buffer,
             checksum: String,
             createdAt: Date,
-            size: Number
+            size: Number,
+            isChunked: { type: Boolean, default: false },
+            chunkCount: { type: Number, default: 1 }
+        });
+
+        this.chunkSchema = new require('mongoose').Schema({
+            sessionId: String,
+            chunkIndex: Number,
+            data: Buffer,
+            createdAt: Date
         });
         
-        // בדיקה אם המודל כבר קיים
+        // בדיקה אם המודלים כבר קיימים
         try {
             this.SessionModel = require('mongoose').model('Session');
+            this.ChunkModel = require('mongoose').model('SessionChunk');
         } catch (error) {
             this.SessionModel = require('mongoose').model('Session', this.sessionSchema);
+            this.ChunkModel = require('mongoose').model('SessionChunk', this.chunkSchema);
         }
+
+        // הגדרת גודל chunk מקסימלי (10MB = בטוח למונגו)
+        this.maxChunkSize = 10 * 1024 * 1024; // 10MB
         
         logger.info('CustomSessionStore initialized');
     }
@@ -176,6 +190,20 @@ class CustomSessionStore {
     // יצירת checksum לקובץ
     createChecksum(buffer) {
         return crypto.createHash('sha256').update(buffer).digest('hex');
+    }
+
+    // פיצול buffer לchunks
+    splitIntoChunks(buffer) {
+        const chunks = [];
+        for (let i = 0; i < buffer.length; i += this.maxChunkSize) {
+            chunks.push(buffer.slice(i, i + this.maxChunkSize));
+        }
+        return chunks;
+    }
+
+    // איחוד chunks חזרה לbuffer
+    combineChunks(chunks) {
+        return Buffer.concat(chunks);
     }
 
     // דחיסת תיקיית Session ל-buffer (ZIP format - יציב יותר)
@@ -279,34 +307,94 @@ class CustomSessionStore {
             }
 
             const checksum = this.createChecksum(buffer);
+            const sizeMB = Math.round(buffer.length / 1024 / 1024 * 100) / 100;
 
-            const sessionData = {
-                sessionId,
-                data: buffer,
-                checksum,
-                createdAt: new Date(),
-                size: buffer.length
-            };
+            // בדיקה אם צריך chunking (מעל 15MB)
+            const needsChunking = buffer.length > 15 * 1024 * 1024;
 
-            try {
-                // שמירה ב-MongoDB
-                await this.SessionModel.findOneAndUpdate(
-                    { sessionId },
-                    sessionData,
-                    { upsert: true }
-                );
+            if (needsChunking) {
+                logger.info(`Large session (${sizeMB}MB) - using chunked storage`);
+                return await this.saveChunkedSession(sessionId, buffer, checksum);
+            } else {
+                // שמירה רגילה לsessions קטנים
+                const sessionData = {
+                    sessionId,
+                    data: buffer,
+                    checksum,
+                    createdAt: new Date(),
+                    size: buffer.length,
+                    isChunked: false,
+                    chunkCount: 1
+                };
 
-                this.lastBackupTime = new Date();
-                logger.info(`Session backed up successfully. Size: ${Math.round(buffer.length / 1024)}KB, Checksum: ${checksum.substring(0, 8)}...`);
-                return true;
+                try {
+                    await this.SessionModel.findOneAndUpdate(
+                        { sessionId },
+                        sessionData,
+                        { upsert: true }
+                    );
 
-            } catch (dbError) {
-                logger.error('Database save failed:', dbError);
-                return false;
+                    this.lastBackupTime = new Date();
+                    logger.info(`Session backed up successfully. Size: ${sizeMB}MB, Checksum: ${checksum.substring(0, 8)}...`);
+                    return true;
+
+                } catch (dbError) {
+                    logger.error('Database save failed:', dbError);
+                    return false;
+                }
             }
 
         } catch (error) {
             logger.error('Error saving session:', error);
+            return false;
+        }
+    }
+
+    // שמירת session גדול בחלקים
+    async saveChunkedSession(sessionId, buffer, checksum) {
+        try {
+            const chunks = this.splitIntoChunks(buffer);
+            logger.info(`Saving session in ${chunks.length} chunks`);
+
+            // מחיקת chunks ישנים
+            await this.ChunkModel.deleteMany({ sessionId });
+
+            // שמירת chunks
+            for (let i = 0; i < chunks.length; i++) {
+                const chunkData = {
+                    sessionId,
+                    chunkIndex: i,
+                    data: chunks[i],
+                    createdAt: new Date()
+                };
+
+                await this.ChunkModel.create(chunkData);
+                logger.info(`Chunk ${i + 1}/${chunks.length} saved (${Math.round(chunks[i].length / 1024)}KB)`);
+            }
+
+            // שמירת metadata
+            const sessionData = {
+                sessionId,
+                data: Buffer.alloc(0), // buffer ריק
+                checksum,
+                createdAt: new Date(),
+                size: buffer.length,
+                isChunked: true,
+                chunkCount: chunks.length
+            };
+
+            await this.SessionModel.findOneAndUpdate(
+                { sessionId },
+                sessionData,
+                { upsert: true }
+            );
+
+            this.lastBackupTime = new Date();
+            logger.info(`Chunked session saved successfully. Total: ${Math.round(buffer.length / 1024 / 1024 * 100) / 100}MB, Chunks: ${chunks.length}, Checksum: ${checksum.substring(0, 8)}...`);
+            return true;
+
+        } catch (error) {
+            logger.error('Error saving chunked session:', error);
             return false;
         }
     }
@@ -328,8 +416,22 @@ class CustomSessionStore {
                 return false;
             }
 
+            let buffer;
+            
+            if (sessionDoc.isChunked) {
+                logger.info(`Restoring chunked session (${sessionDoc.chunkCount} chunks)`);
+                buffer = await this.restoreChunkedSession(sessionId, sessionDoc);
+            } else {
+                buffer = sessionDoc.data;
+            }
+
+            if (!buffer || buffer.length === 0) {
+                logger.error('No session data to restore');
+                return false;
+            }
+
             // בדיקת תקינות
-            const currentChecksum = this.createChecksum(sessionDoc.data);
+            const currentChecksum = this.createChecksum(buffer);
             if (currentChecksum !== sessionDoc.checksum) {
                 logger.error('Session checksum mismatch - data corrupted');
                 return false;
@@ -341,14 +443,41 @@ class CustomSessionStore {
             }
 
             // שחזור הקבצים
-            await this.extractSession(sessionDoc.data, this.sessionPath);
+            await this.extractSession(buffer, this.sessionPath);
             
-            logger.info(`Session restored successfully. Size: ${Math.round(sessionDoc.size / 1024)}KB, Age: ${Math.round((Date.now() - sessionDoc.createdAt) / 60000)} minutes`);
+            logger.info(`Session restored successfully. Size: ${Math.round(sessionDoc.size / 1024 / 1024 * 100) / 100}MB, Age: ${Math.round((Date.now() - sessionDoc.createdAt) / 60000)} minutes`);
             return true;
 
         } catch (error) {
             logger.error('Error restoring session:', error);
             return false;
+        }
+    }
+
+    // שחזור session מחלקים
+    async restoreChunkedSession(sessionId, sessionDoc) {
+        try {
+            const chunks = await this.ChunkModel.find({ sessionId }).sort({ chunkIndex: 1 });
+            
+            if (chunks.length !== sessionDoc.chunkCount) {
+                logger.error(`Chunk count mismatch: expected ${sessionDoc.chunkCount}, found ${chunks.length}`);
+                return null;
+            }
+
+            logger.info(`Combining ${chunks.length} chunks...`);
+            const chunkBuffers = chunks.map(chunk => chunk.data);
+            const buffer = this.combineChunks(chunkBuffers);
+            
+            if (buffer.length !== sessionDoc.size) {
+                logger.error(`Size mismatch: expected ${sessionDoc.size}, got ${buffer.length}`);
+                return null;
+            }
+
+            return buffer;
+
+        } catch (error) {
+            logger.error('Error restoring chunked session:', error);
+            return null;
         }
     }
 
@@ -403,18 +532,27 @@ class CustomSessionStore {
     async cleanupCorruptedSessions() {
         try {
             // מחיקת sessions עם undefined או null
-            const result = await this.SessionModel.deleteMany({ 
+            const sessionResult = await this.SessionModel.deleteMany({ 
                 $or: [
                     { sessionId: { $in: [null, 'undefined', ''] } },
                     { sessionId: { $exists: false } }
                 ]
             });
 
-            if (result.deletedCount > 0) {
-                logger.info(`Cleaned up ${result.deletedCount} corrupted session records`);
+            // מחיקת chunks יתומים
+            const chunkResult = await this.ChunkModel.deleteMany({
+                $or: [
+                    { sessionId: { $in: [null, 'undefined', ''] } },
+                    { sessionId: { $exists: false } }
+                ]
+            });
+
+            const totalCleaned = sessionResult.deletedCount + chunkResult.deletedCount;
+            if (totalCleaned > 0) {
+                logger.info(`Cleaned up ${sessionResult.deletedCount} corrupted sessions and ${chunkResult.deletedCount} orphaned chunks`);
             }
 
-            return result.deletedCount;
+            return totalCleaned;
         } catch (error) {
             logger.error('Error cleaning corrupted sessions:', error);
             return 0;

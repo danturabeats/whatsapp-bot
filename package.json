@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "setup": "node setup.js",
+    "dev": "LOG_LEVEL=debug node index.js",
+    "health": "node health-check.js",
+    "test": "node setup.js && echo \"✅ Setup validation passed\""
   },
   "keywords": [],
   "author": "",
@@ -19,7 +23,9 @@
     "mongoose": "^8.17.0",
     "node-cache": "^5.1.2",
     "node-cron": "^4.2.1",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
+    "tar-stream": "^3.1.7",
     "unzipper": "^0.12.3",
     "whatsapp-web.js": "latest",
     "winston": "^3.17.0"

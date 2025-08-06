@@ -7,8 +7,12 @@ const winston = require('winston');
 const NodeCache = require('node-cache');
 const EventEmitter = require('events');
 const cron = require('node-cron');
-const fs = require('fs');
+const fs = require('fs-extra');
 const path = require('path');
+const archiver = require('archiver');
+const unzipper = require('unzipper');
+const crypto = require('crypto');
+const tarStream = require('tar-stream');
 
 // הגדרת Logger
 const logger = winston.createLogger({
@@ -27,6 +31,9 @@ const logger = winston.createLogger({
 const config = {
     geminiModel: 'gemini-1.5-flash',
     cacheTimeout: 3600, // 1 hour
+    sessionPath: '.wwebjs_auth',
+    sessionBackupInterval: 300000, // 5 minutes
+    sessionValidationInterval: 300000, // 5 minutes
     personality: {
         name: 'ג\'יני',
         style: 'ידידותי, משעשע, ומעט שיווקי',
@@ -140,12 +147,224 @@ class WhatsAppAI {
     }
 }
 
+// מחלקת ניהול Session מותאמת אישית
+class CustomSessionStore {
+    constructor() {
+        this.sessionPath = config.sessionPath;
+        this.sessionCollection = 'whatsapp_sessions';
+        this.backupInterval = null;
+        this.lastBackupTime = null;
+        
+        logger.info('CustomSessionStore initialized');
+    }
+
+    // יצירת checksum לקובץ
+    createChecksum(buffer) {
+        return crypto.createHash('sha256').update(buffer).digest('hex');
+    }
+
+    // דחיסת תיקיית Session ל-buffer
+    async compressSession(sessionPath) {
+        return new Promise((resolve, reject) => {
+            const buffers = [];
+            const archive = archiver('tar', { 
+                gzip: true,
+                gzipOptions: { level: 9 } 
+            });
+
+            archive.on('data', (data) => buffers.push(data));
+            archive.on('end', () => {
+                const buffer = Buffer.concat(buffers);
+                resolve(buffer);
+            });
+            archive.on('error', reject);
+
+            if (fs.existsSync(sessionPath)) {
+                archive.directory(sessionPath, false);
+            }
+            archive.finalize();
+        });
+    }
+
+    // שחזור Session מ-buffer
+    async extractSession(buffer, targetPath) {
+        try {
+            await fs.ensureDir(targetPath);
+            
+            return new Promise((resolve, reject) => {
+                const stream = require('stream');
+                const bufferStream = new stream.PassThrough();
+                bufferStream.end(buffer);
+
+                bufferStream
+                    .pipe(require('zlib').createGunzip())
+                    .pipe(tarStream.extract())
+                    .on('entry', async (header, stream, next) => {
+                        if (header.type === 'file') {
+                            const filePath = path.join(targetPath, header.name);
+                            await fs.ensureDir(path.dirname(filePath));
+                            const writeStream = fs.createWriteStream(filePath);
+                            stream.pipe(writeStream);
+                            writeStream.on('close', next);
+                        } else {
+                            stream.on('end', next);
+                            stream.resume();
+                        }
+                    })
+                    .on('finish', () => {
+                        logger.info(`Session extracted to ${targetPath}`);
+                        resolve();
+                    })
+                    .on('error', reject);
+            });
+        } catch (error) {
+            logger.error('Error extracting session:', error);
+            throw error;
+        }
+    }
+
+    // שמירת Session במסד הנתונים
+    async saveSession(sessionId = 'default') {
+        try {
+            if (!fs.existsSync(this.sessionPath)) {
+                logger.warn('Session path does not exist, skipping backup');
+                return false;
+            }
+
+            logger.info('Starting session backup...');
+            const buffer = await this.compressSession(this.sessionPath);
+            const checksum = this.createChecksum(buffer);
+
+            const sessionData = {
+                sessionId,
+                data: buffer,
+                checksum,
+                createdAt: new Date(),
+                size: buffer.length
+            };
+
+            // שמירה ב-MongoDB
+            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
+                sessionId: { type: String, unique: true },
+                data: Buffer,
+                checksum: String,
+                createdAt: Date,
+                size: Number
+            }));
+
+            await SessionModel.findOneAndUpdate(
+                { sessionId },
+                sessionData,
+                { upsert: true }
+            );
+
+            this.lastBackupTime = new Date();
+            logger.info(`Session backed up successfully. Size: ${Math.round(buffer.length / 1024)}KB, Checksum: ${checksum.substring(0, 8)}...`);
+            return true;
+
+        } catch (error) {
+            logger.error('Error saving session:', error);
+            return false;
+        }
+    }
+
+    // שחזור Session מהמסד
+    async restoreSession(sessionId = 'default') {
+        try {
+            logger.info('Attempting to restore session from database...');
+
+            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
+                sessionId: { type: String, unique: true },
+                data: Buffer,
+                checksum: String,
+                createdAt: Date,
+                size: Number
+            }));
+
+            const sessionDoc = await SessionModel.findOne({ sessionId });
+            
+            if (!sessionDoc) {
+                logger.info('No session found in database');
+                return false;
+            }
+
+            // בדיקת תקינות
+            const currentChecksum = this.createChecksum(sessionDoc.data);
+            if (currentChecksum !== sessionDoc.checksum) {
+                logger.error('Session checksum mismatch - data corrupted');
+                return false;
+            }
+
+            // ניקוי תיקייה קיימת
+            if (fs.existsSync(this.sessionPath)) {
+                await fs.remove(this.sessionPath);
+            }
+
+            // שחזור הקבצים
+            await this.extractSession(sessionDoc.data, this.sessionPath);
+            
+            logger.info(`Session restored successfully. Size: ${Math.round(sessionDoc.size / 1024)}KB, Age: ${Math.round((Date.now() - sessionDoc.createdAt) / 60000)} minutes`);
+            return true;
+
+        } catch (error) {
+            logger.error('Error restoring session:', error);
+            return false;
+        }
+    }
+
+    // בדיקת קיום Session תקין
+    async sessionExists(sessionId = 'default') {
+        try {
+            const SessionModel = require('mongoose').model('Session', new require('mongoose').Schema({
+                sessionId: { type: String, unique: true },
+                data: Buffer,
+                checksum: String,
+                createdAt: Date,
+                size: Number
+            }));
+
+            const session = await SessionModel.findOne({ sessionId });
+            return session && session.data && session.data.length > 0;
+        } catch (error) {
+            logger.error('Error checking session existence:', error);
+            return false;
+        }
+    }
+
+    // התחלת גיבוי תקופתי
+    startPeriodicBackup() {
+        if (this.backupInterval) {
+            clearInterval(this.backupInterval);
+        }
+
+        this.backupInterval = setInterval(async () => {
+            if (fs.existsSync(this.sessionPath)) {
+                await this.saveSession();
+            }
+        }, config.sessionBackupInterval);
+
+        logger.info(`Periodic backup started (every ${config.sessionBackupInterval / 1000} seconds)`);
+    }
+
+    // עצירת גיבוי תקופתי
+    stopPeriodicBackup() {
+        if (this.backupInterval) {
+            clearInterval(this.backupInterval);
+            this.backupInterval = null;
+            logger.info('Periodic backup stopped');
+        }
+    }
+}
+
 // מחלקת הבוט הראשית
 class PresentorWhatsAppBot extends EventEmitter {
     constructor() {
         super();
         
-        // אתחול WhatsApp Client
+        // אתחול מערכת ניהול Session
+        this.sessionStore = new CustomSessionStore();
+        
+        // אתחול WhatsApp Client עם הגדרות משופרות
         this.client = new Client({
             authStrategy: new LocalAuth({
                 dataPath: config.sessionPath
@@ -160,8 +379,15 @@ class PresentorWhatsAppBot extends EventEmitter {
                     '--no-first-run',
                     '--no-zygote',
                     '--single-process',
-                    '--disable-gpu'
+                    '--disable-gpu',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding'
                 ]
+            },
+            webVersionCache: {
+                type: 'remote',
+                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
             }
         });
         
@@ -183,33 +409,65 @@ class PresentorWhatsAppBot extends EventEmitter {
     initializeWhatsAppEvents() {
         // QR Code להתחברות
         this.client.on('qr', (qr) => {
-            logger.info('QR Code received, generating data URL...');
+            logger.info('QR Code received, generating enhanced display...');
             
-            // =========================================================
-            // <<< התיקון הסופי והאמין ביותר >>>
-            // =========================================================
-            // המר את ה-QR לקישור data URL
-            qrcode.toDataURL(qr, (err, url) => {
+            // שמירת QR במטמון לwebapi
+            this.currentQR = qr;
+            
+            // יצירת data URL לדפדפן
+            const QRCode = require('qrcode');
+            QRCode.toDataURL(qr, { errorCorrectionLevel: 'M', width: 512 }, (err, url) => {
                 if (err) {
                     logger.error('Failed to generate QR code data URL', err);
                     return;
                 }
                 
-                // הדפס את הקישור ללוגים. את זה Render לא יכול לסנן.
-                console.log("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-                console.log("!!!          SCAN QR CODE HERE           !!!");
-                console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-                console.log("COPY THE LINK BELOW AND PASTE IT IN YOUR BROWSER:");
-                console.log(url); // <-- הקישור שצריך להעתיק
-                console.log("\n--------------------------------------------\n");
+                this.qrDataURL = url;
+                
+                // הדפסה משופרת
+                console.log("\n" + "=".repeat(60));
+                console.log("📱 WHATSAPP QR CODE - SCAN TO AUTHENTICATE");
+                console.log("=".repeat(60));
+                console.log("🔗 BROWSER LINK:");
+                console.log(url);
+                console.log("=".repeat(60));
+                console.log("📋 Or access via: http://localhost:" + (process.env.PORT || 3000) + "/qr");
+                console.log("⏰ QR Code expires in 20 seconds - scan quickly!");
+                console.log("=".repeat(60) + "\n");
 
-                logger.info('QR code data URL has been logged.');
+                logger.info('QR code ready - check console or browser endpoint');
+                
+                // ניקוי QR אחרי 20 שניות
+                setTimeout(() => {
+                    this.currentQR = null;
+                    this.qrDataURL = null;
+                }, 20000);
+            });
+            
+            // QR terminal backup
+            qrcode.generate(qr, { small: true }, (qrString) => {
+                console.log("📟 Terminal QR (backup):\n" + qrString);
             });
         });
         
         // התחברות מוצלחת
-        this.client.on('ready', () => {
+        this.client.on('ready', async () => {
             logger.info('WhatsApp Bot is ready! ✅');
+            
+            // שמירת Session למסד נתונים
+            setTimeout(async () => {
+                try {
+                    const saved = await this.sessionStore.saveSession();
+                    if (saved) {
+                        logger.info('Initial session backup completed successfully');
+                        // התחלת גיבוי תקופתי
+                        this.sessionStore.startPeriodicBackup();
+                    }
+                } catch (error) {
+                    logger.error('Error during initial session backup:', error);
+                }
+            }, 60000); // המתנה של דקה לוודא שהsession מוכן
+
             this.emit('ready');
             this.sendStartupNotification();
         });
@@ -431,6 +689,64 @@ class PresentorWhatsAppBot extends EventEmitter {
         cron.schedule('0 3 * * *', () => {
             this.cleanupCache();
         });
+        
+        // בדיקת תקינות session כל 5 דקות
+        cron.schedule('*/5 * * * *', async () => {
+            await this.performSessionHealthCheck();
+        });
+        
+        // גיבוי session כל שעה (נוסף על הגיבוי הרגיל)
+        cron.schedule('0 * * * *', async () => {
+            if (this.client && this.client.info) {
+                await this.sessionStore.saveSession();
+            }
+        });
+    }
+    
+    // בדיקת תקינות Session
+    async performSessionHealthCheck() {
+        try {
+            // בדיקה שהלקוח מחובר
+            if (!this.client || !this.client.info) {
+                logger.warn('Session health check: Client not connected');
+                return;
+            }
+
+            // בדיקה שקבצי Session קיימים
+            if (!fs.existsSync(config.sessionPath)) {
+                logger.error('Session health check: Session files missing!');
+                
+                // ניסיון שחזור מהמסד נתונים
+                const restored = await this.sessionStore.restoreSession();
+                if (restored) {
+                    logger.info('Session health check: Restored session from database');
+                } else {
+                    logger.error('Session health check: Failed to restore session');
+                }
+                return;
+            }
+
+            // בדיקת גודל תיקיית Session (אמור להיות לפחות כמה קבצים)
+            const files = await fs.readdir(config.sessionPath);
+            if (files.length < 3) {
+                logger.warn(`Session health check: Only ${files.length} files in session directory`);
+            }
+
+            // בדיקת קישוריות
+            try {
+                const state = await this.client.getState();
+                if (state !== 'CONNECTED') {
+                    logger.warn(`Session health check: Client state is ${state}`);
+                }
+            } catch (error) {
+                logger.error('Session health check: Failed to get client state:', error.message);
+            }
+
+            logger.info('Session health check completed successfully');
+
+        } catch (error) {
+            logger.error('Session health check error:', error);
+        }
     }
     
     async sendDailyGreetings() {
@@ -514,22 +830,94 @@ class PresentorWhatsAppBot extends EventEmitter {
     }
     
     async reconnect() {
-        logger.info('Attempting to reconnect...');
-        setTimeout(() => {
-            this.client.initialize();
-        }, 5000);
+        logger.info('Attempting to reconnect with session recovery...');
+        
+        try {
+            // עצירת גיבויים תקופתיים
+            this.sessionStore.stopPeriodicBackup();
+            
+            // ניסיון שחזור session
+            const restored = await this.sessionStore.restoreSession();
+            if (restored) {
+                logger.info('Session restored for reconnection');
+            }
+            
+            setTimeout(() => {
+                this.client.initialize();
+            }, 5000);
+            
+        } catch (error) {
+            logger.error('Error during reconnection attempt:', error);
+            // ניסיון נקי ללא session
+            setTimeout(() => {
+                if (fs.existsSync(config.sessionPath)) {
+                    fs.removeSync(config.sessionPath);
+                }
+                this.client.initialize();
+            }, 10000);
+        }
     }
     
     // API Methods
     async start() {
-        logger.info('Starting WhatsApp Bot...');
-        await this.client.initialize();
+        logger.info('Starting WhatsApp Bot with enhanced session management...');
+        
+        try {
+            // ניסיון שחזור Session מהמסד נתונים
+            const sessionRestored = await this.sessionStore.restoreSession();
+            if (sessionRestored) {
+                logger.info('Session restored from database, attempting connection...');
+            } else {
+                logger.info('No valid session found, will require QR code scan');
+            }
+            
+            // אתחול הלקוח
+            await this.client.initialize();
+            
+        } catch (error) {
+            logger.error('Error during bot startup:', error);
+            
+            // במקרה של שגיאה, נסה לנקות session פגום ולהתחיל מחדש
+            if (fs.existsSync(config.sessionPath)) {
+                logger.info('Cleaning potentially corrupted session...');
+                await fs.remove(config.sessionPath);
+            }
+            
+            // ניסיון שני
+            await this.client.initialize();
+        }
     }
     
     async stop() {
-        logger.info('Stopping WhatsApp Bot...');
-        if (this.client) {
-            await this.client.destroy();
+        logger.info('Stopping WhatsApp Bot gracefully...');
+        
+        try {
+            // עצירת גיבויים תקופתיים
+            if (this.sessionStore) {
+                this.sessionStore.stopPeriodicBackup();
+                
+                // גיבוי אחרון לפני עצירה
+                if (fs.existsSync(config.sessionPath)) {
+                    await this.sessionStore.saveSession();
+                    logger.info('Final session backup completed');
+                }
+            }
+            
+            // עצירת הלקוח
+            if (this.client) {
+                await this.client.destroy();
+                logger.info('WhatsApp client stopped');
+            }
+            
+            // ניקוי זיכרון
+            this.activeChats.clear();
+            this.messageQueue = [];
+            this.mediaCache.clear();
+            
+            logger.info('WhatsApp Bot stopped successfully');
+            
+        } catch (error) {
+            logger.error('Error during bot shutdown:', error);
         }
     }
     
